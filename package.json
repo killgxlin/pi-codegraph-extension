@@ -1,5 +1,5 @@
 {
-  "name": "pi-codegraph",
+  "name": "pi-codegraph-extension",
   "version": "0.1.0",
   "description": "CodeGraph MCP tools for the Pi Coding Agent — semantic code search, impact analysis, call graphs, and deep exploration.",
   "license": "MIT",

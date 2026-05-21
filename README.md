@@ -17,7 +17,7 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 ## Install
 
 ```bash
-pi install npm:@gripebomb/pi-codegraph
+pi install npm:pi-codegraph-extension
 ```
 
 Or copy the extension file manually into your Pi extension directory.
