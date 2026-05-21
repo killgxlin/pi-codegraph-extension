@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Lock files (optional - uncomment if you don't want to commit lockfiles)
+# package-lock.json

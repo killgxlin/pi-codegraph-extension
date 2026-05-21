@@ -1,0 +1,56 @@
+{
+  "name": "@gripebomb/pi-codegraph",
+  "version": "0.1.0",
+  "description": "CodeGraph MCP tools for the Pi Coding Agent — semantic code search, impact analysis, call graphs, and deep exploration.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "codegraph",
+    "mcp",
+    "@earendil-works/pi-coding-agent"
+  ],
+  "homepage": "https://github.com/gripebomb/pi-codegraph-extension#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gripebomb/pi-codegraph-extension.git"
+  },
+  "bugs": {
+    "url": "https://github.com/gripebomb/pi-codegraph-extension/issues"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/codegraph.js",
+      "types": "./dist/codegraph.d.ts"
+    }
+  },
+  "main": "./dist/codegraph.js",
+  "types": "./dist/codegraph.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./dist/codegraph.js"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "typebox": "^1.0.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "latest",
+    "typescript": "latest"
+  },
+  "scripts": {
+    "build": "tsc",
+    "pack:check": "npm pack --dry-run",
+    "prepublishOnly": "tsc"
+  }
+}
