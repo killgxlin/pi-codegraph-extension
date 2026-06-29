@@ -31,12 +31,13 @@
   "types": "./dist/codegraph.d.ts",
   "files": [
     "dist",
+    "extensions",
     "README.md",
     "LICENSE"
   ],
   "pi": {
     "extensions": [
-      "./dist/codegraph.js"
+      "./extensions/codegraph.ts"
     ]
   },
   "peerDependencies": {
