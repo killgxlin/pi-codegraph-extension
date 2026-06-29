@@ -22,6 +22,7 @@ import * as path from "node:path";
  * - Adds the project-local `node_modules/.bin` to PATH before spawning.
  * - Supports CODEGRAPH_COMMAND and CODEGRAPH_ARGS overrides.
  * - Normalizes absolute file paths passed to codegraph_files into repo-relative filters.
+ * - Discovers available tools from the CodeGraph MCP server via `tools/list`.
  *
  * Expected CodeGraph install:
  *
@@ -35,10 +36,35 @@ import * as path from "node:path";
  */
 
 const REQUEST_TIMEOUT_MS = Number(process.env.CODEGRAPH_TIMEOUT_MS ?? 30000);
+const DIAGNOSTIC_STDERR_LIMIT = 4000;
 
 type MCPToolResult = {
   content: Array<{ type: "text"; text: string }>;
   isError?: boolean;
+};
+
+type MCPToolDefinition = {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+};
+
+type MCPToolsListResult = {
+  tools?: MCPToolDefinition[];
+};
+
+type ToolMetadata = {
+  label: string;
+  promptSnippet: string;
+  promptGuidelines: string[];
+  detailsName: string;
+};
+
+type ToolRegistration = {
+  piName: string;
+  mcpName: string;
+  definition: MCPToolDefinition;
+  metadata: ToolMetadata;
 };
 
 function splitArgs(input: string): string[] {
@@ -113,6 +139,10 @@ function getCodeGraphSpawn(cwd: string): {
   return { command, args, env };
 }
 
+function formatCommand(command: string, args: string[]): string {
+  return [command, ...args].join(" ");
+}
+
 function expandHome(input: string): string {
   if (input === "~") {
     return process.env.HOME ?? input;
@@ -141,14 +171,10 @@ function normalizeFilesPath(value: unknown, projectRoot: string): string | undef
   const raw = expandHome(value.trim());
   const resolved = path.resolve(projectRoot, raw);
 
-  // CodeGraph's `path` parameter is a filter under the indexed project.
-  // If Pi passes the full project root as `path`, omit the filter.
   if (resolved === projectRoot) {
     return undefined;
   }
 
-  // If Pi passes an absolute path inside the project, convert it to a
-  // repo-relative path so CodeGraph can match indexed files.
   const relative = path.relative(projectRoot, resolved);
   if (
     path.isAbsolute(raw) &&
@@ -159,8 +185,130 @@ function normalizeFilesPath(value: unknown, projectRoot: string): string | undef
     return relative.split(path.sep).join("/");
   }
 
-  // Otherwise assume the user already supplied a repo-relative path.
   return raw.replaceAll("\\", "/").replace(/^\.?\//, "");
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sanitizeToolName(name: string): string | undefined {
+  const sanitized = name.replace(/[^A-Za-z0-9_-]/g, "_");
+  if (!sanitized || !/^[A-Za-z_]/.test(sanitized)) return undefined;
+  return sanitized;
+}
+
+function toTitle(input: string): string {
+  return input
+    .replace(/^codegraph[_-]?/, "")
+    .split(/[_-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function normalizeInputSchema(toolName: string, inputSchema: unknown): Record<string, unknown> {
+  if (!isObject(inputSchema)) {
+    console.warn(
+      `[CodeGraph MCP] Tool ${toolName} did not provide an object inputSchema; using an empty object schema.`
+    );
+    return Type.Object({}) as unknown as Record<string, unknown>;
+  }
+
+  if (inputSchema.type === "object" || isObject(inputSchema.properties)) {
+    return inputSchema;
+  }
+
+  console.warn(
+    `[CodeGraph MCP] Tool ${toolName} provided a non-object inputSchema; using an empty object schema.`
+  );
+  return Type.Object({}) as unknown as Record<string, unknown>;
+}
+
+function normalizeMCPResult(result: unknown): MCPToolResult {
+  if (isObject(result) && Array.isArray(result.content)) {
+    return result as MCPToolResult;
+  }
+
+  return {
+    content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+  };
+}
+
+function appendProjectPath(args: Record<string, unknown>, projectRoot: string): Record<string, unknown> {
+  return {
+    ...args,
+    projectPath: projectRoot,
+  };
+}
+
+function prepareToolArguments(toolName: string, params: Record<string, unknown>, projectRoot: string): Record<string, unknown> {
+  if (toolName !== "codegraph_files") {
+    return appendProjectPath(params, projectRoot);
+  }
+
+  const normalizedPath = normalizeFilesPath(params.path, projectRoot);
+  const args: Record<string, unknown> = { ...params, projectPath: projectRoot };
+
+  if (normalizedPath == null) {
+    delete args.path;
+  } else {
+    args.path = normalizedPath;
+  }
+
+  return args;
+}
+
+function createDiagnosticMessage(err: unknown, cwd: string): string {
+  const message = err instanceof Error ? err.message : String(err);
+  const { command, args } = getCodeGraphSpawn(cwd);
+  const commandLine = formatCommand(command, args);
+
+  let diagnostic =
+    `${message}\n\n` +
+    `CodeGraph MCP command: ${commandLine}\n` +
+    `Working directory: ${cwd}\n\n`;
+
+  if (
+    message.includes("ENOENT") ||
+    message.includes("spawn") ||
+    message.includes("Failed to start CodeGraph")
+  ) {
+    diagnostic +=
+      "Install globally:\n" +
+      "  npm install -g @colbymchenry/codegraph\n\n" +
+      "Or install in the project:\n" +
+      "  npm install -D @colbymchenry/codegraph\n" +
+      "  pnpm add -D @colbymchenry/codegraph\n" +
+      "  bun add -d @colbymchenry/codegraph\n\n" +
+      "Then verify from the same shell that launches Pi:\n" +
+      "  codegraph --version\n" +
+      "  codegraph serve --mcp\n\n" +
+      "Optional override:\n" +
+      "  CODEGRAPH_COMMAND=codegraph\n" +
+      "  CODEGRAPH_ARGS=\"serve --mcp\"";
+  } else if (message.includes("not initialized") || message.includes(".codegraph")) {
+    diagnostic +=
+      "Initialize and index the project first:\n" +
+      "  codegraph init -i\n" +
+      "  codegraph status";
+  }
+
+  return diagnostic.trim();
+}
+
+function handleError(err: unknown, toolName: string, cwd: string): {
+  content: Array<{ type: "text"; text: string }>;
+  isError: true;
+  details: { error: string; tool: string };
+} {
+  const message = createDiagnosticMessage(err, cwd);
+
+  return {
+    content: [{ type: "text", text: `CodeGraph ${toolName} failed: ${message}` }],
+    isError: true,
+    details: { error: message, tool: toolName },
+  };
 }
 
 class MCPClient {
@@ -170,9 +318,13 @@ class MCPClient {
   private timers = new Map<string, NodeJS.Timeout>();
   private idCounter = 0;
   private closed = false;
+  private stderrBuffer = "";
 
-  constructor(cwd: string) {
+  readonly commandLine: string;
+
+  constructor(private readonly cwd: string) {
     const { command, args, env } = getCodeGraphSpawn(cwd);
+    this.commandLine = formatCommand(command, args);
 
     this.proc = spawn(command, args, {
       cwd,
@@ -194,8 +346,10 @@ class MCPClient {
     const stderr = this.proc.stderr;
     if (stderr) {
       stderr.on("data", (data: Buffer) => {
-        const text = data.toString().trim();
-        if (text) console.error("[CodeGraph MCP]", text);
+        const text = data.toString();
+        this.stderrBuffer = (this.stderrBuffer + text).slice(-DIAGNOSTIC_STDERR_LIMIT);
+        const trimmed = text.trim();
+        if (trimmed) console.error("[CodeGraph MCP]", trimmed);
       });
     }
 
@@ -204,24 +358,38 @@ class MCPClient {
 
     this.proc.on("error", (err) => {
       this.closed = true;
-      for (const [id, handler] of this.pending) {
-        clearTimeout(this.timers.get(id)!);
-        handler({ error: { message: `Failed to start CodeGraph MCP server: ${err.message}` } });
-      }
-      this.pending.clear();
-      this.timers.clear();
+      this.rejectPending(`Failed to start CodeGraph MCP server: ${err.message}`);
     });
 
     this.proc.on("exit", (code, signal) => {
       this.closed = true;
       const reason = signal ? `signal ${signal}` : `code ${code}`;
-      for (const [id, handler] of this.pending) {
-        clearTimeout(this.timers.get(id)!);
-        handler({ error: { message: `MCP server exited with ${reason}` } });
-      }
-      this.pending.clear();
-      this.timers.clear();
+      this.rejectPending(`MCP server exited with ${reason}`);
     });
+  }
+
+  get diagnostics(): string {
+    const stderr = this.stderrBuffer.trim();
+    return [
+      `CodeGraph MCP command: ${this.commandLine}`,
+      `Working directory: ${this.cwd}`,
+      stderr ? `Recent stderr:\n${stderr}` : undefined,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  private rejectPending(message: string): void {
+    const details = this.diagnostics;
+    const errorMessage = details ? `${message}\n\n${details}` : message;
+
+    for (const [id, handler] of this.pending) {
+      clearTimeout(this.timers.get(id)!);
+      handler({ error: { message: errorMessage } });
+    }
+
+    this.pending.clear();
+    this.timers.clear();
   }
 
   private onLine(line: string): void {
@@ -248,7 +416,7 @@ class MCPClient {
         capabilities: {},
         clientInfo: {
           name: "pi-codegraph-extension",
-          version: "1.0.0",
+          version: "0.1.1",
         },
         rootUri,
       },
@@ -259,6 +427,14 @@ class MCPClient {
     return result;
   }
 
+  async listTools(signal?: AbortSignal): Promise<MCPToolDefinition[]> {
+    const result = (await this.request("tools/list", {}, signal)) as MCPToolsListResult;
+    if (!Array.isArray(result.tools)) {
+      throw new Error("CodeGraph MCP tools/list returned no tools array");
+    }
+    return result.tools.filter((tool) => typeof tool.name === "string" && tool.name.length > 0);
+  }
+
   async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<any> {
     return this.request("tools/call", { name, arguments: args }, signal);
   }
@@ -266,7 +442,7 @@ class MCPClient {
   private request(method: string, params: unknown, signal?: AbortSignal): Promise<any> {
     return new Promise((resolve, reject) => {
       if (this.closed) {
-        reject(new Error("MCP server connection is closed"));
+        reject(new Error(`MCP server connection is closed\n\n${this.diagnostics}`));
         return;
       }
 
@@ -282,12 +458,11 @@ class MCPClient {
 
       const timer = setTimeout(() => {
         cleanup();
-        reject(new Error(`MCP request timeout (${REQUEST_TIMEOUT_MS}ms): ${method}`));
+        reject(new Error(`MCP request timeout (${REQUEST_TIMEOUT_MS}ms): ${method}\n\n${this.diagnostics}`));
       }, REQUEST_TIMEOUT_MS);
 
       const onAbort = () => {
         cleanup();
-        this.close();
         reject(new Error("MCP request cancelled by user"));
       };
 
@@ -297,7 +472,7 @@ class MCPClient {
       const stdin = this.proc.stdin;
       if (!stdin) {
         cleanup();
-        reject(new Error("No stdin from MCP process"));
+        reject(new Error(`No stdin from MCP process\n\n${this.diagnostics}`));
         return;
       }
 
@@ -346,334 +521,137 @@ class MCPClient {
   }
 }
 
-async function runMCPTool(
-  cwd: string,
-  toolName: string,
-  args: Record<string, unknown>,
-  signal?: AbortSignal
-): Promise<MCPToolResult> {
-  const projectRoot = resolveProjectRoot(cwd, args.projectPath);
-  const client = new MCPClient(projectRoot);
+class CodeGraphMCPRegistry {
+  private clients = new Map<string, Promise<MCPClient>>();
+  private discovered = new Map<string, Promise<MCPToolDefinition[]>>();
 
-  try {
-    const rootUri = pathToFileURL(projectRoot).href;
-    await client.initialize(rootUri, signal);
+  async getClient(projectRoot: string, signal?: AbortSignal): Promise<MCPClient> {
+    const existing = this.clients.get(projectRoot);
+    if (existing) return existing;
 
-    const finalArgs = {
-      ...args,
-      projectPath: projectRoot,
-    };
+    const created = this.createClient(projectRoot, signal).catch((err) => {
+      this.clients.delete(projectRoot);
+      throw err;
+    });
+    this.clients.set(projectRoot, created);
+    return created;
+  }
 
-    const result = await client.callTool(toolName, finalArgs, signal);
-    return result as MCPToolResult;
-  } finally {
-    client.close();
+  async discoverTools(projectRoot: string, signal?: AbortSignal): Promise<MCPToolDefinition[]> {
+    const existing = this.discovered.get(projectRoot);
+    if (existing) return existing;
+
+    const discovered = this.getClient(projectRoot, signal)
+      .then((client) => client.listTools(signal))
+      .then((tools) => {
+        if (tools.length === 0) {
+          throw new Error("CodeGraph MCP tools/list returned an empty tools array");
+        }
+        return tools;
+      })
+      .catch((err) => {
+        this.discovered.delete(projectRoot);
+        throw err;
+      });
+
+    this.discovered.set(projectRoot, discovered);
+    return discovered;
+  }
+
+  async callTool(
+    projectRoot: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    signal?: AbortSignal
+  ): Promise<MCPToolResult> {
+    const client = await this.getClient(projectRoot, signal);
+    const result = await client.callTool(toolName, args, signal);
+    return normalizeMCPResult(result);
+  }
+
+  closeAll(): void {
+    const clientPromises = [...this.clients.values()];
+    this.clients.clear();
+    this.discovered.clear();
+
+    for (const clientPromise of clientPromises) {
+      clientPromise.then((client) => client.close()).catch(() => {});
+    }
+  }
+
+  private async createClient(projectRoot: string, signal?: AbortSignal): Promise<MCPClient> {
+    const client = new MCPClient(projectRoot);
+    try {
+      const rootUri = pathToFileURL(projectRoot).href;
+      await client.initialize(rootUri, signal);
+      return client;
+    } catch (err) {
+      client.close();
+      throw err;
+    }
   }
 }
 
-function handleError(err: unknown, toolName: string): {
-  content: Array<{ type: "text"; text: string }>;
-  isError: true;
-  details: { error: string; tool: string };
-} {
-  let message = err instanceof Error ? err.message : String(err);
-
-  if (
-    message.includes("ENOENT") ||
-    message.includes("spawn") ||
-    message.includes("Failed to start CodeGraph")
-  ) {
-    message =
-      "CodeGraph CLI not found or could not be started.\n\n" +
-      "Install globally:\n" +
-      "  npm install -g @colbymchenry/codegraph\n\n" +
-      "Or install in the project:\n" +
-      "  npm install -D @colbymchenry/codegraph\n" +
-      "  pnpm add -D @colbymchenry/codegraph\n" +
-      "  bun add -d @colbymchenry/codegraph\n\n" +
-      "Then verify from the same shell that launches Pi:\n" +
-      "  codegraph --version\n" +
-      "  codegraph serve --mcp\n\n" +
-      "Optional override:\n" +
-      "  CODEGRAPH_COMMAND=codegraph\n" +
-      "  CODEGRAPH_ARGS=\"serve --mcp\"";
-  } else if (message.includes("not initialized") || message.includes(".codegraph")) {
-    message =
-      `${message}\n\nInitialize and index the project first:\n` +
-      "  codegraph init -i\n" +
-      "  codegraph status";
-  }
-
-  return {
-    content: [{ type: "text" as const, text: `CodeGraph ${toolName} failed: ${message}` }],
-    isError: true,
-    details: { error: message, tool: toolName },
-  };
-}
-
-const projectPathProperty = Type.Optional(
-  Type.String({
-    description:
-      "Path to a different project with .codegraph/ initialized. If omitted, uses current project.",
-  })
-);
-
-export default function codegraphExtension(pi: ExtensionAPI) {
-  pi.registerTool({
-    name: "codegraph_search",
+const TOOL_METADATA: Record<string, ToolMetadata> = {
+  codegraph_search: {
     label: "CodeGraph Search",
-    description: "Search for symbols across the codebase using CodeGraph's semantic index",
     promptSnippet: "Search codebase symbols via CodeGraph",
     promptGuidelines: [
       "Use codegraph_search when you need to find symbols by name across the codebase",
       "Use for: finding function definitions, class implementations, types, routes",
-      "Prefer codegraph_context for exploration tasks — it composes multiple searches in one call",
+      "Prefer codegraph_explore for exploration tasks — it returns comprehensive context in one call",
     ],
-    parameters: Type.Object({
-      query: Type.String({ description: "Symbol name or partial name, e.g. auth or UserService" }),
-      kind: Type.Optional(
-        Type.Union(
-          [
-            Type.Literal("function"),
-            Type.Literal("method"),
-            Type.Literal("class"),
-            Type.Literal("interface"),
-            Type.Literal("type"),
-            Type.Literal("variable"),
-            Type.Literal("route"),
-            Type.Literal("component"),
-          ],
-          { description: "Filter by node kind" }
-        )
-      ),
-      limit: Type.Optional(Type.Number({ description: "Maximum results. Default: 20", default: 20 })),
-      projectPath: projectPathProperty,
-    }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      try {
-        const result = await runMCPTool(
-          ctx.cwd,
-          "codegraph_search",
-          {
-            query: params.query,
-            kind: params.kind,
-            limit: params.limit ?? 20,
-            projectPath: params.projectPath,
-          },
-          signal
-        );
-
-        return {
-          content: result.content,
-          isError: result.isError,
-          details: { tool: "search", query: params.query },
-        };
-      } catch (err) {
-        return handleError(err, "search");
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "codegraph_context",
+    detailsName: "search",
+  },
+  codegraph_context: {
     label: "CodeGraph Context",
-    description:
-      "Build comprehensive code context for a task. PRIMARY tool — composes search, node, callers, and callees in one call.",
     promptSnippet: "Build code context via CodeGraph",
     promptGuidelines: [
-      "Use codegraph_context as the PRIMARY tool for understanding code areas",
+      "Use codegraph_context only when the installed CodeGraph MCP server exposes it",
+      "For newer CodeGraph versions, prefer codegraph_explore for onboarding, feature exploration, and bug investigation",
       "Returns large context — often enough without additional tool calls",
-      "Use for: onboarding, feature exploration, bug investigation",
     ],
-    parameters: Type.Object({
-      task: Type.String({ description: "Task description, bug, or feature to build context for" }),
-      maxNodes: Type.Optional(Type.Number({ description: "Maximum symbols to include. Default: 20", default: 20 })),
-      includeCode: Type.Optional(Type.Boolean({ description: "Include code snippets. Default: true", default: true })),
-      projectPath: projectPathProperty,
-    }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      try {
-        const result = await runMCPTool(
-          ctx.cwd,
-          "codegraph_context",
-          {
-            task: params.task,
-            maxNodes: params.maxNodes ?? 20,
-            includeCode: params.includeCode ?? true,
-            projectPath: params.projectPath,
-          },
-          signal
-        );
-
-        return {
-          content: result.content,
-          isError: result.isError,
-          details: { tool: "context", task: params.task },
-        };
-      } catch (err) {
-        return handleError(err, "context");
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "codegraph_callers",
+    detailsName: "context",
+  },
+  codegraph_callers: {
     label: "CodeGraph Callers",
-    description: "Find all functions/methods that call a specific symbol",
     promptSnippet: "Find callers of a symbol",
     promptGuidelines: [
       "Use codegraph_callers before modifying a function to see call sites",
       "Use for: understanding usage patterns, impact analysis",
     ],
-    parameters: Type.Object({
-      symbol: Type.String({ description: "Function, method, or class name to find callers for" }),
-      limit: Type.Optional(Type.Number({ description: "Maximum callers. Default: 20", default: 20 })),
-      projectPath: projectPathProperty,
-    }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      try {
-        const result = await runMCPTool(
-          ctx.cwd,
-          "codegraph_callers",
-          {
-            symbol: params.symbol,
-            limit: params.limit ?? 20,
-            projectPath: params.projectPath,
-          },
-          signal
-        );
-
-        return {
-          content: result.content,
-          isError: result.isError,
-          details: { tool: "callers", symbol: params.symbol },
-        };
-      } catch (err) {
-        return handleError(err, "callers");
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "codegraph_callees",
+    detailsName: "callers",
+  },
+  codegraph_callees: {
     label: "CodeGraph Callees",
-    description: "Find all functions/methods that a specific symbol calls",
     promptSnippet: "Find callees of a symbol",
     promptGuidelines: [
       "Use codegraph_callees to understand dependencies and code flow",
       "Use for: tracing execution paths, understanding what a function depends on",
     ],
-    parameters: Type.Object({
-      symbol: Type.String({ description: "Function, method, or class name to find callees for" }),
-      limit: Type.Optional(Type.Number({ description: "Maximum callees. Default: 20", default: 20 })),
-      projectPath: projectPathProperty,
-    }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      try {
-        const result = await runMCPTool(
-          ctx.cwd,
-          "codegraph_callees",
-          {
-            symbol: params.symbol,
-            limit: params.limit ?? 20,
-            projectPath: params.projectPath,
-          },
-          signal
-        );
-
-        return {
-          content: result.content,
-          isError: result.isError,
-          details: { tool: "callees", symbol: params.symbol },
-        };
-      } catch (err) {
-        return handleError(err, "callees");
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "codegraph_impact",
+    detailsName: "callees",
+  },
+  codegraph_impact: {
     label: "CodeGraph Impact",
-    description: "Analyze the impact radius of changing a symbol",
     promptSnippet: "Analyze impact of changes",
     promptGuidelines: [
       "Use codegraph_impact before making changes to see affected code",
       "Use for: refactor planning, assessing blast radius of modifications",
     ],
-    parameters: Type.Object({
-      symbol: Type.String({ description: "Symbol to analyze impact for" }),
-      depth: Type.Optional(Type.Number({ description: "Dependency traversal depth. Default: 2", default: 2 })),
-      projectPath: projectPathProperty,
-    }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      try {
-        const result = await runMCPTool(
-          ctx.cwd,
-          "codegraph_impact",
-          {
-            symbol: params.symbol,
-            depth: params.depth ?? 2,
-            projectPath: params.projectPath,
-          },
-          signal
-        );
-
-        return {
-          content: result.content,
-          isError: result.isError,
-          details: { tool: "impact", symbol: params.symbol },
-        };
-      } catch (err) {
-        return handleError(err, "impact");
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "codegraph_node",
+    detailsName: "impact",
+  },
+  codegraph_node: {
     label: "CodeGraph Node",
-    description: "Get detailed information about a specific code symbol",
     promptSnippet: "Get symbol details via CodeGraph",
     promptGuidelines: [
       "Use codegraph_node when you need full source code of a symbol",
       "Set includeCode=true only when needed — it increases token usage",
       "Use codegraph_search first to find the exact symbol name",
     ],
-    parameters: Type.Object({
-      symbol: Type.String({ description: "Symbol name to get details for" }),
-      includeCode: Type.Optional(Type.Boolean({ description: "Include full source code. Default: false", default: false })),
-      projectPath: projectPathProperty,
-    }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      try {
-        const result = await runMCPTool(
-          ctx.cwd,
-          "codegraph_node",
-          {
-            symbol: params.symbol,
-            includeCode: params.includeCode ?? false,
-            projectPath: params.projectPath,
-          },
-          signal
-        );
-
-        return {
-          content: result.content,
-          isError: result.isError,
-          details: { tool: "node", symbol: params.symbol },
-        };
-      } catch (err) {
-        return handleError(err, "node");
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "codegraph_explore",
+    detailsName: "node",
+  },
+  codegraph_explore: {
     label: "CodeGraph Explore",
-    description:
-      "Deep exploration tool — returns comprehensive context for a topic in a single call. Groups source code by file with relationship maps.",
     promptSnippet: "Deep exploration via CodeGraph",
     promptGuidelines: [
       "Use codegraph_explore for thorough understanding of unfamiliar topics",
@@ -681,77 +659,19 @@ export default function codegraphExtension(pi: ExtensionAPI) {
       "Use codegraph_search first to discover relevant symbol names",
       "Respect the explore budget — do not make more calls than recommended",
     ],
-    parameters: Type.Object({
-      query: Type.String({
-        description:
-          "Symbol names, file names, or short code terms to explore. Bad: how are prompts loaded. Good: readAgentsFromDirectory createClaudeSession",
-      }),
-      maxFiles: Type.Optional(Type.Number({ description: "Maximum files to include source from. Default: 12", default: 12 })),
-      projectPath: projectPathProperty,
-    }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      try {
-        const result = await runMCPTool(
-          ctx.cwd,
-          "codegraph_explore",
-          {
-            query: params.query,
-            maxFiles: params.maxFiles ?? 12,
-            projectPath: params.projectPath,
-          },
-          signal
-        );
-
-        return {
-          content: result.content,
-          isError: result.isError,
-          details: { tool: "explore", query: params.query },
-        };
-      } catch (err) {
-        return handleError(err, "explore");
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "codegraph_status",
+    detailsName: "explore",
+  },
+  codegraph_status: {
     label: "CodeGraph Status",
-    description: "Get the status of the CodeGraph index — files, nodes, edges, backend type",
     promptSnippet: "Check CodeGraph index status",
     promptGuidelines: [
       "Use codegraph_status to verify the index is ready before other operations",
       "Check backend type — wasm fallback is slower than native",
     ],
-    parameters: Type.Object({
-      projectPath: projectPathProperty,
-    }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      try {
-        const result = await runMCPTool(
-          ctx.cwd,
-          "codegraph_status",
-          {
-            projectPath: params.projectPath,
-          },
-          signal
-        );
-
-        return {
-          content: result.content,
-          isError: result.isError,
-          details: { tool: "status" },
-        };
-      } catch (err) {
-        return handleError(err, "status");
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "codegraph_files",
+    detailsName: "status",
+  },
+  codegraph_files: {
     label: "CodeGraph Files",
-    description:
-      "Get project file structure from the CodeGraph index. Faster than filesystem scanning. Use first when exploring project structure.",
     promptSnippet: "List project files via CodeGraph",
     promptGuidelines: [
       "Use codegraph_files first when exploring project structure or finding files",
@@ -759,60 +679,147 @@ export default function codegraphExtension(pi: ExtensionAPI) {
       "Use tree format for overview, grouped for language breakdown",
       "For path, pass a repo-relative directory like src/components; do not pass the full project root",
     ],
-    parameters: Type.Object({
-      path: Type.Optional(
-        Type.String({
-          description:
-            "Repo-relative filter under the project, e.g. src/components. Absolute paths are normalized when possible.",
-        })
-      ),
-      pattern: Type.Optional(Type.String({ description: "Glob pattern filter, e.g. *.tsx or **/*.test.ts" })),
-      format: Type.Optional(
-        Type.Union([Type.Literal("tree"), Type.Literal("flat"), Type.Literal("grouped")], {
-          description: "Output format. Default: tree",
-        })
-      ),
-      includeMetadata: Type.Optional(Type.Boolean({ description: "Include language and symbol count. Default: true", default: true })),
-      maxDepth: Type.Optional(Type.Number({ description: "Maximum directory depth" })),
-      projectPath: projectPathProperty,
-    }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      try {
-        const projectRoot = resolveProjectRoot(ctx.cwd, params.projectPath);
-        const normalizedPath = normalizeFilesPath(params.path, projectRoot);
+    detailsName: "files",
+  },
+};
 
-        const args: Record<string, unknown> = {
-          projectPath: projectRoot,
-        };
+function metadataFor(tool: MCPToolDefinition): ToolMetadata {
+  const known = TOOL_METADATA[tool.name];
+  if (known) return known;
 
-        if (normalizedPath != null) args.path = normalizedPath;
-        if (params.pattern != null) args.pattern = params.pattern;
-        if (params.format != null) args.format = params.format;
-        if (params.includeMetadata != null) args.includeMetadata = params.includeMetadata;
-        if (params.maxDepth != null) args.maxDepth = params.maxDepth;
+  const title = toTitle(tool.name) || tool.name;
+  return {
+    label: `CodeGraph ${title}`,
+    promptSnippet: tool.description ?? `Call ${tool.name} via CodeGraph MCP`,
+    promptGuidelines: [
+      `Use ${tool.name} when the installed CodeGraph MCP server exposes this tool`,
+      "Arguments are validated using the MCP tools/list inputSchema returned by CodeGraph",
+    ],
+    detailsName: title.toLowerCase().replaceAll(" ", "_"),
+  };
+}
 
-        const result = await runMCPTool(ctx.cwd, "codegraph_files", args, signal);
+function buildToolRegistrations(tools: MCPToolDefinition[]): ToolRegistration[] {
+  const usedPiNames = new Set<string>();
+  const registrations: ToolRegistration[] = [];
 
-        return {
-          content: result.content,
-          isError: result.isError,
-          details: { tool: "files", args },
-        };
-      } catch (err) {
-        return handleError(err, "files");
+  for (const tool of tools) {
+    const piName = sanitizeToolName(tool.name);
+    if (!piName) {
+      console.warn(`[CodeGraph MCP] Skipping tool with unsupported name: ${tool.name}`);
+      continue;
+    }
+
+    if (usedPiNames.has(piName)) {
+      console.warn(
+        `[CodeGraph MCP] Skipping tool ${tool.name}; sanitized name ${piName} conflicts with another tool.`
+      );
+      continue;
+    }
+
+    usedPiNames.add(piName);
+    registrations.push({
+      piName,
+      mcpName: tool.name,
+      definition: tool,
+      metadata: metadataFor(tool),
+    });
+  }
+
+  return registrations;
+}
+
+export default function codegraphExtension(pi: ExtensionAPI) {
+  const registry = new CodeGraphMCPRegistry();
+  const registeredToolNames = new Set<string>();
+
+  function registerDiscoveredTools(tools: MCPToolDefinition[]): string[] {
+    const registered: string[] = [];
+
+    for (const registration of buildToolRegistrations(tools)) {
+      if (registeredToolNames.has(registration.piName)) continue;
+
+      const parameters = normalizeInputSchema(registration.mcpName, registration.definition.inputSchema);
+      const description =
+        registration.definition.description ?? `Call ${registration.mcpName} via CodeGraph MCP`;
+
+      pi.registerTool({
+        name: registration.piName,
+        label: registration.metadata.label,
+        description,
+        promptSnippet: registration.metadata.promptSnippet,
+        promptGuidelines: registration.metadata.promptGuidelines,
+        parameters: parameters as any,
+        async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+          try {
+            const rawParams = isObject(params) ? params : {};
+            const projectRoot = resolveProjectRoot(ctx.cwd, rawParams.projectPath);
+            const args = prepareToolArguments(registration.mcpName, rawParams, projectRoot);
+            const result = await registry.callTool(projectRoot, registration.mcpName, args, signal);
+
+            return {
+              content: result.content,
+              isError: result.isError,
+              details: { tool: registration.metadata.detailsName, mcpTool: registration.mcpName, args },
+            };
+          } catch (err) {
+            return handleError(err, registration.metadata.detailsName, ctx.cwd);
+          }
+        },
+      });
+
+      registeredToolNames.add(registration.piName);
+      registered.push(registration.piName);
+    }
+
+    return registered;
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    try {
+      const tools = await registry.discoverTools(ctx.cwd);
+      const registered = registerDiscoveredTools(tools);
+      if (registered.length > 0) {
+        console.error(`[CodeGraph MCP] Registered tools: ${registered.join(", ")}`);
       }
-    },
+    } catch (err) {
+      const message = createDiagnosticMessage(err, ctx.cwd);
+      console.error(`[CodeGraph MCP] Tool discovery failed. No CodeGraph tools were registered.\n${message}`);
+      if (ctx.hasUI) {
+        ctx.ui.notify(`CodeGraph MCP tool discovery failed. No CodeGraph tools were registered.\n${message}`, "error");
+      }
+    }
+  });
+
+  pi.on("session_shutdown", () => {
+    registry.closeAll();
+    registeredToolNames.clear();
   });
 
   pi.registerCommand("codegraph-status", {
-    description: "Check CodeGraph MCP server connectivity",
+    description: "Check CodeGraph MCP server connectivity and discovered tools",
     handler: async (_args, ctx) => {
       try {
-        const result = await runMCPTool(ctx.cwd, "codegraph_status", {});
-        const text = result.content.map((c) => c.text).join("\n");
-        ctx.ui.notify(`CodeGraph MCP connected.\n${text}`, "info");
+        const projectRoot = resolveProjectRoot(ctx.cwd);
+        const tools = await registry.discoverTools(projectRoot);
+        const registered = registerDiscoveredTools(tools);
+        const status = await registry.callTool(
+          projectRoot,
+          "codegraph_status",
+          { projectPath: projectRoot },
+          undefined
+        );
+        const text = status.content.map((c) => c.text).join("\n");
+        const toolNames = tools.map((tool) => tool.name).join(", ");
+        const registrationText = registered.length
+          ? `Newly registered Pi tools: ${registered.join(", ")}`
+          : "Pi tools were already registered for the discovered MCP tools.";
+        ctx.ui.notify(
+          `CodeGraph MCP connected.\nDiscovered tools: ${toolNames}\n${registrationText}\n\n${text}`,
+          "info"
+        );
       } catch (err) {
-        const handled = handleError(err, "status");
+        const handled = handleError(err, "status", ctx.cwd);
         ctx.ui.notify(handled.content[0]?.text ?? "CodeGraph MCP connection failed", "error");
       }
     },

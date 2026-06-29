@@ -56,15 +56,20 @@ export CODEGRAPH_TIMEOUT_MS=30000
 
 ## Tools
 
+The extension discovers tools from the installed CodeGraph MCP server via `tools/list` and only registers tools that the server actually exposes. This keeps Pi's tool list aligned with your CodeGraph version.
+
+Common tools include:
+
 - `codegraph_status`
 - `codegraph_files`
 - `codegraph_search`
-- `codegraph_context`
 - `codegraph_callers`
 - `codegraph_callees`
 - `codegraph_impact`
 - `codegraph_node`
 - `codegraph_explore`
+
+Older CodeGraph versions may also expose `codegraph_context`. Newer CodeGraph versions no longer expose that tool, so this extension will not register it unless it appears in `tools/list`. Use `codegraph_explore` for broad exploration and onboarding-style context gathering.
 
 ## Notes
 
