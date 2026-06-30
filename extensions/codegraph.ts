@@ -349,7 +349,10 @@ class MCPClient {
         const text = data.toString();
         this.stderrBuffer = (this.stderrBuffer + text).slice(-DIAGNOSTIC_STDERR_LIMIT);
         const trimmed = text.trim();
-        if (trimmed) console.error("[CodeGraph MCP]", trimmed);
+        // 过滤掉启动信息，只保留真正的错误
+        if (trimmed && !trimmed.includes("Attached to shared daemon")) {
+          console.error("[CodeGraph MCP]", trimmed);
+        }
       });
     }
 
@@ -779,9 +782,7 @@ export default function codegraphExtension(pi: ExtensionAPI) {
     try {
       const tools = await registry.discoverTools(ctx.cwd);
       const registered = registerDiscoveredTools(tools);
-      if (registered.length > 0) {
-        console.error(`[CodeGraph MCP] Registered tools: ${registered.join(", ")}`);
-      }
+      // 注册成功，静默处理
     } catch (err) {
       const message = createDiagnosticMessage(err, ctx.cwd);
       console.error(`[CodeGraph MCP] Tool discovery failed. No CodeGraph tools were registered.\n${message}`);
