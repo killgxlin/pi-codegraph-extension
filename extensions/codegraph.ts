@@ -350,7 +350,11 @@ class MCPClient {
         this.stderrBuffer = (this.stderrBuffer + text).slice(-DIAGNOSTIC_STDERR_LIMIT);
         const trimmed = text.trim();
         // 过滤掉启动信息，只保留真正的错误
-        if (trimmed && !trimmed.includes("Attached to shared daemon")) {
+        if (
+          trimmed &&
+          !trimmed.includes("Attached to shared daemon") &&
+          !trimmed.includes("Registered tools:")
+        ) {
           console.error("[CodeGraph MCP]", trimmed);
         }
       });
